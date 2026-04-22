@@ -27,7 +27,7 @@
   "n_features": 20,
   "target": "ipc_phase",
   "threshold": 0.9013868570327759,
-  "trained_at": "2026-04-22T10:18:19.025750+00:00",
+  "trained_at": "2026-04-22T15:35:15.475585+00:00",
   "train_accuracy": 0.9840569877883311,
   "test_accuracy": 0.9512516469038208
 }
