@@ -210,3 +210,4 @@ venv/
 data/raw/
 __pycache__/
 *.pkl
+*.keras
