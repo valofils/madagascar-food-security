@@ -1,11 +1,65 @@
 {
-  "roc_auc": 0.899,
-  "threshold": 0.790582,
-  "val_f1": 0.9318,
-  "val_precision": 0.9318,
-  "val_recall": 0.9318,
+  "roc_auc": 0.8006,
+  "threshold": 0.901387,
+  "threshold_strategy": "recall\u226570%",
+  "val_f1": 0.9195,
+  "val_precision": 0.8889,
+  "val_recall": 0.9524,
   "test_precision": 0.0,
   "test_recall": 0.0,
   "test_f1": 0.0,
-  "test_support": 37
+  "test_support": 37,
+  "cv": {
+    "folds": [
+      {
+        "year": 2019,
+        "n_crisis": 11,
+        "threshold": 0.9739731550216675,
+        "roc_auc": 0.989997057958223,
+        "precision": 0.5555555555555556,
+        "recall": 0.9090909090909091,
+        "f1": 0.6896551724137931
+      },
+      {
+        "year": 2020,
+        "n_crisis": 23,
+        "threshold": 0.33704257011413574,
+        "roc_auc": 0.9750252780586451,
+        "precision": 0.7586206896551724,
+        "recall": 0.9565217391304348,
+        "f1": 0.8461538461538461
+      },
+      {
+        "year": 2021,
+        "n_crisis": 63,
+        "threshold": 0.2651786506175995,
+        "roc_auc": 0.9769982632578051,
+        "precision": 0.92,
+        "recall": 0.7301587301587301,
+        "f1": 0.8141592920353983
+      },
+      {
+        "year": 2022,
+        "n_crisis": 79,
+        "threshold": 0.33270299434661865,
+        "roc_auc": 0.9871029376641988,
+        "precision": 0.7155963302752294,
+        "recall": 0.9873417721518988,
+        "f1": 0.8297872340425532
+      },
+      {
+        "year": 2023,
+        "n_crisis": 4,
+        "threshold": 0.9095860123634338,
+        "roc_auc": 0.9779249448123619,
+        "precision": 0.125,
+        "recall": 1.0,
+        "f1": 0.2222222222222222
+      }
+    ],
+    "mean_roc_auc": 0.9814,
+    "mean_precision": 0.615,
+    "mean_recall": 0.9166,
+    "mean_f1": 0.6804
+  }
 }

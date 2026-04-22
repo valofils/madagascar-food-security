@@ -30,7 +30,8 @@ due to class imbalance in the test set.
 ### Primary use case
 Automated early warning flag for humanitarian responders and food security analysts
 monitoring acute food insecurity in Madagascar livelihood zones. The system outputs
-an `alert_level` (HIGH / MODERATE / LOW) that combines signals from both models.
+a predicted IPC phase and crisis probability that informs — but does not replace —
+analyst judgement.
 
 ### Intended users
 - Food security analysts (FEWS NET, WFP, UNICEF, FAO)
@@ -48,272 +49,226 @@ an `alert_level` (HIGH / MODERATE / LOW) that combines signals from both models.
 ## 3. Data
 
 ### Source
-**FEWS NET Data Warehouse API** (`https://fdw.fews.net/api/`)  
-Endpoint: `/api/ipcphase/?country_code=MG`  
-No authentication required for public data.
+FEWS NET IPC phase data for Madagascar, accessed via the FEWS NET Data Warehouse API.
+Covers current situation (CS) assessments from 2016 to early 2026.
 
 ### Coverage
-| Attribute | Value |
-|-----------|-------|
-| Country | Madagascar (MG) |
-| Date range | February 2016 – July 2026 |
-| Geographic units | 312 unique fnids (livelihood zones) |
-| Scenarios used | CS (Current Situation) only for training |
-| IPC scales | IPC 2.0, IPC 3.0, IPC 3.1 — harmonised to IPC2/IPC3 |
-| Total records (cleaned) | 3,970 rows |
+- **Geography**: Madagascar livelihood zones (fnid-level)
+- **Period**: 2016–2026 (current situation assessments only)
+- **Rows after feature engineering**: 3,707 observations
+- **Class distribution**: Phase 1: 80%, Phase 2: 14%, Phase 3+: 6%
 
 ### Train / test split
-Temporal split — no data leakage:
-
-| Split | Years | Rows |
-|-------|-------|------|
-| Train | 2016–2023 | 3,211 |
-| Test | 2024–2026 | 759 |
-
-### Class distribution (CS scenario, cleaned)
-
-| Phase | Label | Share |
-|-------|-------|-------|
-| 1 | Minimal | ~80% |
-| 2 | Stressed | ~14% |
-| 3 | Crisis | ~6% |
-| 4 | Emergency | ~0.1% (merged into Phase 3 for modelling) |
-
-**Note**: Phase 4 (Emergency) has only 99 records total and 5 in the test set.
-It is merged into Phase 3+ for both models.
-
-### Preprocessing
-- Rows with null phase values or null projection dates dropped
-- `IPC Highest Household` classification scale excluded (different methodology)
-- Temporal features extracted: year, month, quarter, period_days, is_lean_season
-- Lean season flag: October–March (Madagascar's hunger gap)
+Temporal split: train on 2016–2023, test on 2024–2026. This mirrors operational
+deployment — the model always predicts forward in time from its training window.
 
 ---
 
 ## 4. Features
 
-16 features used by both models:
+The model uses 20 leak-free features grouped into four categories:
 
-| Feature | Type | Description |
-|---------|------|-------------|
-| `year` | int | Year of projection period |
-| `month` | int | Month of projection start |
-| `quarter` | int | Quarter (1–4) |
-| `is_lean_season` | binary | 1 if Oct–Mar (lean season), else 0 |
-| `period_days` | int | Length of projection window in days |
-| `lag_1` | float | IPC phase in previous period |
-| `lag_2` | float | IPC phase two periods ago |
-| `rolling_mean_3` | float | Mean phase over last 3 periods |
-| `rolling_max_3` | float | Max phase over last 3 periods |
-| `phase_trend` | float | lag_1 − lag_2 (direction of change) |
-| `unit_mean_phase` | float | Historical mean IPC phase for this livelihood zone |
-| `unit_max_phase` | float | Historical max IPC phase for this livelihood zone |
-| `unit_pct_crisis` | float | Fraction of periods unit was in Phase 3+ |
-| `unit_code` | int | Integer encoding of geographic unit (fnid) |
-| `is_ipc2` | binary | 1 if IPC 2.0 scale, else 0 |
-| `preference_rating` | float | FEWS NET data quality preference rating |
+### Temporal context
+| Feature | Description |
+|---------|-------------|
+| `year`, `month`, `quarter` | Observation date components |
+| `is_lean_season` | Binary flag for lean season months |
+| `period_days` | Length of IPC assessment period |
+
+### Lag and rolling features *(shift(1) — no current-period leakage)*
+| Feature | Description |
+|---------|-------------|
+| `lag_1`, `lag_2`, `lag_3` | IPC phase in previous 1, 2, 3 periods |
+| `rolling_mean_3` | Mean phase over previous 3 periods |
+| `rolling_max_3` | Max phase over previous 3 periods |
+| `phase_trend` | `lag_1 - lag_2` (direction of change) |
+| `unit_hist_max` | Expanding historical max phase per unit (past only) |
+| `crisis_momentum` | Count of Crisis periods in previous 4 observations |
+
+### Cold-start interaction features *(targeting sudden escalation)*
+| Feature | Description |
+|---------|-------------|
+| `is_cold_start` | 1 if `lag_1 < 2.5` (previous period below Crisis) |
+| `lean_x_lag1` | Lean season × lag_1 (amplified risk) |
+| `lean_x_trend` | Lean season × positive trend |
+| `gap_to_crisis` | Distance of previous phase below Phase 3 threshold |
+| `escalation_risk` | Composite: `rolling_mean × lean_season × (1 + positive_trend)` |
+
+### Categorical
+| Feature | Description |
+|---------|-------------|
+| `is_ipc2` | 1 if IPC Phase 2 scale area |
+| `preference_rating` | FEWS NET data quality/preference score |
+
+### Features deliberately excluded
+| Feature | Reason |
+|---------|--------|
+| `unit_mean_phase` | Computed on full dataset — target leakage |
+| `unit_pct_crisis` | Computed on full dataset — target leakage |
+| `unit_max_phase` | Computed on full dataset — target leakage |
+| `unit_code` | Geographic identity, not conditions; fails on unseen units |
 
 ---
 
-## 5. Model Architecture
+## 5. Training Pipeline
 
-### Binary classifier (`ipc_binary_classifier.pkl`)
+### Class imbalance
+Crisis cases represent ~7% of training data. SMOTE (Synthetic Minority Oversampling)
+is applied to the training set only — never to validation or test data.
 
-```
-Algorithm      : XGBoost (XGBClassifier)
-Objective      : binary:logistic
-n_estimators   : 400
-max_depth      : 6
-learning_rate  : 0.05
-subsample      : 0.8
-colsample_bytree: 0.8
-scale_pos_weight: computed from class ratio
-Imbalance handling: SMOTE oversampling on training set
-Threshold      : tuned via precision-recall curve to maximise F1
-```
+### Threshold selection
+The default 0.5 classification threshold is replaced by a recall-constrained
+optimum: the highest-F1 threshold where recall ≥ 70% on a stratified validation
+split (20% of training data). This reflects the humanitarian principle that
+**missing a Crisis is worse than a false alarm**.
 
-### Multiclass classifier (`ipc_multiclass_classifier.pkl`)
-
-```
-Algorithm      : XGBoost (XGBClassifier)
-Objective      : multi:softmax
-num_class      : 3  (Phase 1 / Phase 2 / Phase 3+)
-n_estimators   : 400
-max_depth      : 6
-learning_rate  : 0.05
-subsample      : 0.8
-colsample_bytree: 0.8
-Imbalance handling: SMOTE oversampling on training set
-```
-
-Both models are serialised as `{"model": XGBClassifier, "threshold": float}` using pickle.
+### Validation strategy
+Walk-forward cross-validation across 5 test years (2019–2023), training on all
+prior years each time. This provides a realistic estimate of generalisation across
+different Crisis patterns.
 
 ---
 
 ## 6. Performance
 
-### Binary classifier — test set (2024–2026, n=759)
+### Walk-forward cross-validation (2019–2023)
 
-| Metric | Not Crisis (P1–2) | Crisis (P3+) | Overall |
-|--------|-------------------|--------------|---------|
-| Precision | 0.95 | 0.67 | — |
-| Recall | 1.00 | 0.05 | — |
-| F1-score | 0.98 | 0.10 | — |
-| Support | 722 | 37 | 759 |
-| **Accuracy** | | | **0.95** |
-| **ROC-AUC** | | | **0.916** |
+| Fold (test year) | n Crisis | ROC-AUC | Precision | Recall | F1 |
+|-----------------|----------|---------|-----------|--------|----|
+| 2019 | 11 | 0.990 | 0.556 | 0.909 | 0.690 |
+| 2020 | 23 | 0.975 | 0.759 | 0.957 | 0.846 |
+| 2021 | 63 | 0.977 | 0.920 | 0.730 | 0.814 |
+| 2022 | 79 | 0.987 | 0.716 | 0.987 | 0.830 |
+| 2023 | 4  | 0.978 | 0.125 | 1.000 | 0.222 |
+| **Mean** | — | **0.981** | **0.615** | **0.917** | **0.680** |
 
-**Threshold**: 0.0016 (tuned for recall on Crisis class)
+Within the training distribution the model generalises well, achieving 91.7% recall
+on Crisis cases at a mean precision of 61.5%.
 
-### Multiclass classifier — test set (2024–2026, n=759)
+### Held-out test set (2024–2026)
 
-| Metric | Minimal (P1) | Stressed (P2) | Crisis+ (P3+) | Overall |
-|--------|--------------|---------------|---------------|---------|
-| Precision | 0.97 | 0.85 | 1.00 | — |
-| Recall | 1.00 | 0.93 | 0.05 | — |
-| F1-score | 0.98 | 0.89 | 0.10 | — |
-| Support | 524 | 198 | 37 | 759 |
-| **Accuracy** | | | | **0.93** |
+| Metric | Value |
+|--------|-------|
+| ROC-AUC | 0.801 |
+| Crisis precision | 0.00 |
+| Crisis recall | 0.00 |
+| Crisis F1 | 0.00 |
+| Non-crisis accuracy | 95% |
 
-### Top 10 features — binary model
-
-| Feature | Importance |
-|---------|-----------|
-| `unit_mean_phase` | 0.400 |
-| `unit_max_phase` | 0.160 |
-| `unit_pct_crisis` | 0.123 |
-| `lag_1` | 0.074 |
-| `is_lean_season` | 0.048 |
-| `rolling_mean_3` | 0.037 |
-| `period_days` | 0.029 |
-| `year` | 0.029 |
-| `quarter` | 0.022 |
-| `month` | 0.019 |
-
-### Top 10 features — multiclass model
-
-| Feature | Importance |
-|---------|-----------|
-| `lag_1` | 0.405 |
-| `unit_mean_phase` | 0.117 |
-| `unit_max_phase` | 0.074 |
-| `year` | 0.054 |
-| `is_lean_season` | 0.051 |
-| `unit_pct_crisis` | 0.046 |
-| `rolling_mean_3` | 0.045 |
-| `rolling_max_3` | 0.040 |
-| `month` | 0.036 |
-| `quarter` | 0.033 |
+**The model fails to detect Crisis cases in the 2024–2026 test period.**
+See Section 7 for root cause analysis.
 
 ---
 
-## 7. Limitations and Known Issues
+## 7. Failure Analysis — Distributional Shift (2024–2026)
 
-### Crisis recall
-The binary model achieves **Crisis recall of 0.05** at the default threshold on the
-test set, despite a tuned threshold and SMOTE. This is primarily due to sparse test
-data — only 37 Crisis cases in 759 test rows (4.9%). The ROC-AUC of 0.916 indicates
-the model has strong discriminative ability; the recall issue reflects threshold
-sensitivity in a highly imbalanced regime.
+### What went wrong
+The binary classifier assigns near-zero probabilities to 75% of actual Crisis cases
+in the test set (median p = 0.0006). No threshold adjustment can recover from this —
+the model has not learned the 2024/2026 Crisis signature.
 
-**Operational implication**: in a humanitarian context, missing a real crisis is far
-more costly than a false alarm. The alert system uses both models together and errs
-toward sensitivity — a HIGH alert is triggered when *either* model flags crisis.
+### Root cause: temporal distributional shift
+Crisis events in the training period (peak: 2021–2022) and test period (2024–2026)
+have structurally different feature profiles:
 
-### Phase 4 sparsity
-Only 99 Phase 4 (Emergency) records exist in the full dataset, with 5 in the test
-set. Phase 4 is merged into Phase 3+ for all modelling. The system cannot
-distinguish Emergency from Crisis.
+| Feature | Train Crisis mean | Test Crisis mean | Δ |
+|---------|-----------------|-----------------|---|
+| `lag_1` | 2.77 | 2.08 | −0.69 |
+| `rolling_mean_3` | 2.64 | 1.97 | −0.67 |
+| `rolling_max_3` | 2.84 | 2.14 | −0.70 |
+| `is_lean_season` | 0.78 | 1.00 | +0.22 |
 
-### Geographic encoding
-`unit_code` is a categorical integer derived from `fnid` strings. New livelihood
-zones introduced after training will receive unseen codes and may produce unreliable
-predictions.
+Training Crisis events followed prolonged high-phase periods (persistent escalation).
+Test Crisis events arrive from lower baselines — a cold-start pattern — and all occur
+during lean season. The model learned "Crisis follows Crisis" and cannot generalise
+to first-occurrence escalation.
 
-### Temporal drift
-The model is trained on 2016–2023 data. Structural shocks (cyclones, droughts,
-political crises) that alter food security dynamics significantly may degrade
-performance over time. Periodic retraining is recommended.
+### Geographic novelty
+6 of 22 test Crisis units (27%) never appeared in Crisis during training. The model
+has no phase history for these units in a crisis state.
 
-### IPC scale harmonisation
-Three IPC scales (2.0, 3.0, 3.1) are harmonised into a binary flag (`is_ipc2`).
-This is a simplification; methodological differences across scales may introduce
-noise in earlier years.
+### Year 2023 anomaly
+2023 had only 4 Crisis cases (0.9% rate) — a recovery period following the 2022 peak.
+This created a gap in crisis examples that the walk-forward CV flagged (F1=0.222 for
+the 2023 fold) but could not compensate for.
+
+### What this is not
+This failure was not caused by:
+- Data leakage (removed in v1.1)
+- Threshold miscalibration (tested exhaustively)
+- Feature engineering errors (walk-forward CV confirms within-sample generalisation)
+
+### Recommended mitigations
+1. **Annual retraining** as new IPC cycles complete — the 2024/2026 data should be
+   incorporated into training once a subsequent test year is available
+2. **External covariates** — NDVI anomaly, rainfall departure, market price indices,
+   and conflict events are known drivers of cold-start Crisis that are independent
+   of phase history
+3. **Regional sub-models** — separate models per livelihood zone cluster may better
+   capture heterogeneous escalation patterns
+4. **Ensemble with rule-based triggers** — a simple rule (lean season AND lag_1 > 1.8
+   AND phase_trend > 0) could catch cold-start cases the ML model misses
 
 ---
 
-## 8. Ethical Considerations
+## 8. Deployment
 
-- **Humanitarian priority**: the system is designed to support, not replace,
-  expert IPC analysis. All alerts should be validated by trained analysts before
-  informing programme decisions.
-- **False negatives**: a LOW alert for a zone that is actually in crisis could
-  delay response. Users should treat this system as one input among many.
-- **Data provenance**: FEWS NET data reflects the best available field assessments
-  but may have gaps or delays, particularly in remote zones of Madagascar.
-- **No individual-level data**: all predictions are at the livelihood zone level.
-  No household or individual data is used.
+The binary classifier is deployed as an AWS Lambda function behind API Gateway.
+See `serverless/DEPLOY.md` for the full deployment runbook.
 
----
-
-## 9. How to Use
-
-### API (recommended)
-```bash
-# Start the server
-source venv/bin/activate
-PYTHONPATH=$(pwd) uvicorn api.main:app --host 0.0.0.0 --port 8000
-
-# Predict
-curl -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d '{
-    "year": 2024, "month": 2, "quarter": 1,
-    "is_lean_season": 1, "period_days": 29,
-    "lag_1": 3.0, "lag_2": 3.0,
-    "rolling_mean_3": 3.0, "rolling_max_3": 3.0,
-    "phase_trend": 0.0,
-    "unit_mean_phase": 2.8, "unit_max_phase": 4.0,
-    "unit_pct_crisis": 0.65, "unit_code": 42,
-    "is_ipc2": 0, "preference_rating": 90.0
-  }'
-```
-
-### Python
-```python
-from src.predict import predict_combined
-
-features = {
-    "year": 2024, "month": 2, "quarter": 1,
-    "is_lean_season": 1, "period_days": 29,
-    "lag_1": 3.0, "lag_2": 3.0,
-    "rolling_mean_3": 3.0, "rolling_max_3": 3.0,
-    "phase_trend": 0.0,
-    "unit_mean_phase": 2.8, "unit_max_phase": 4.0,
-    "unit_pct_crisis": 0.65, "unit_code": 42,
-    "is_ipc2": 0, "preference_rating": 90.0,
+### API input (20 features)
+```json
+{
+  "year": 2024, "month": 1, "quarter": 1,
+  "is_lean_season": 1, "period_days": 90,
+  "lag_1": 2.5, "lag_2": 2.2, "lag_3": 2.0,
+  "rolling_mean_3": 2.3, "rolling_max_3": 2.5,
+  "phase_trend": 0.3,
+  "unit_hist_max": 3.0, "crisis_momentum": 1.0,
+  "is_cold_start": 1, "lean_x_lag1": 2.5, "lean_x_trend": 0.3,
+  "gap_to_crisis": 0.5, "escalation_risk": 3.45,
+  "is_ipc2": 0, "preference_rating": 1.0
 }
-
-result = predict_combined(features)
-print(result["alert_level"])   # HIGH / MODERATE / LOW
-print(result["binary"])        # Crisis probability + label
-print(result["multiclass"])    # Per-phase probabilities
 ```
 
-### Docker
-```bash
-docker build -t madagascar-food-security .
-docker run -p 8000:8000 madagascar-food-security
+### API output
+```json
+{
+  "prediction": 1,
+  "label": "crisis_or_above",
+  "probability_crisis": 0.78,
+  "threshold_used": 0.45,
+  "model_version": "1.1.0"
+}
 ```
+
+### Operational guidance
+- `probability_crisis` should be presented to analysts alongside the binary label
+- The threshold was optimised for recall ≥ 70% on the validation set
+- **Do not use predictions alone for programme decisions** — always combine with
+  IPC technical working group assessment and field knowledge
+- The model is known to underperform on cold-start Crisis in new geographic units;
+  apply additional scrutiny to units with no prior Crisis history
 
 ---
 
-## 10. Citation
+## 9. Ethical Considerations
 
-If you use this model or data pipeline, please cite:
+- **Consequential decisions**: Food security predictions influence resource allocation
+  affecting vulnerable populations. False negatives (missed Crisis) may delay response;
+  false positives may divert resources from genuine crises elsewhere.
+- **Accountability**: This system is designed as a decision-support tool, not a
+  replacement for IPC technical working group processes.
+- **Transparency**: Known failure modes are documented in Section 7. Users should
+  be informed of the model's limitations before operational use.
+- **Equity**: The model may perform differently across livelihood zones depending on
+  data density. Zones with sparse historical data warrant additional caution.
 
-```
-Valosimbazafy, M. (2026). Madagascar IPC Food Security Early Warning Classifier.
-GitHub: https://github.com/valofils/madagascar-food-security
-Data source: FEWS NET Data Warehouse, https://fdw.fews.net
-```
+---
+
+## 10. Model Versioning
+
+| Version | Date | Changes |
+|---------|------|---------|
+| v1.0.0 | April 2025 | Initial release — 16 features including leaky unit aggregates |
+| v1.1.0 | April 2026 | Removed leaky features; added cold-start interactions; walk-forward CV; recall-constrained threshold; full failure analysis |

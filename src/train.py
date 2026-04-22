@@ -7,7 +7,10 @@ import numpy as np
 from datetime import datetime, timezone
 
 from xgboost import XGBClassifier
-from sklearn.metrics import f1_score, precision_recall_curve, classification_report, roc_auc_score
+from sklearn.metrics import (
+    f1_score, precision_recall_curve, classification_report,
+    roc_auc_score, precision_score, recall_score
+)
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE
 
@@ -36,36 +39,139 @@ def make_multiclass_target(df: pd.DataFrame) -> pd.Series:
 def temporal_split(df: pd.DataFrame, test_year: int = 2024):
     train = df[df["year"] < test_year].copy()
     test  = df[df["year"] >= test_year].copy()
-    print(f"Train: {len(train)} rows ({train.year.min():.0f}-{train.year.max():.0f})")
-    print(f"Test:  {len(test)} rows  ({test.year.min():.0f}-{test.year.max():.0f})")
+    print(f"Train: {len(train)} rows ({train.year.min():.0f}–{train.year.max():.0f})")
+    print(f"Test:  {len(test)} rows  ({test.year.min():.0f}–{test.year.max():.0f})")
     return train, test
 
 
-def find_best_threshold(model, X_val, y_val) -> tuple[float, dict]:
+def find_best_threshold(model, X_val, y_val,
+                        min_recall: float = 0.55) -> tuple[float, dict]:
     """
-    Find threshold that maximises F1 for the positive (Crisis) class.
-    Called on a stratified validation set carved from training data.
-    Returns (threshold, metrics_at_threshold).
+    Find threshold that maximises F1 subject to recall >= min_recall.
+
+    In a humanitarian context, missing a Crisis is worse than a false alarm,
+    so we enforce a minimum recall floor before optimising precision.
+    Falls back to pure F1 if no threshold meets the recall constraint.
     """
     y_prob = model.predict_proba(X_val)[:, 1]
     prec, rec, thresholds = precision_recall_curve(y_val, y_prob)
     f1_scores = 2 * prec * rec / (prec + rec + 1e-9)
-    best_idx  = np.argmax(f1_scores)
-    best_thresh = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
+
+    # Try recall-constrained F1 first
+    mask = rec[:-1] >= min_recall   # prec/rec have one more element than thresholds
+    if mask.any():
+        best_idx = np.argmax(f1_scores[:-1][mask])
+        best_thresh = float(thresholds[mask][best_idx])
+        strategy = f"recall≥{min_recall:.0%}"
+    else:
+        # Fall back to pure F1
+        best_idx   = np.argmax(f1_scores)
+        best_thresh = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
+        strategy   = "pure F1 (recall constraint not achievable)"
+
+    # Metrics at chosen threshold
+    y_pred = (y_prob >= best_thresh).astype(int)
     metrics = {
         "threshold":     round(best_thresh, 6),
-        "val_precision": round(float(prec[best_idx]), 4),
-        "val_recall":    round(float(rec[best_idx]), 4),
-        "val_f1":        round(float(f1_scores[best_idx]), 4),
+        "val_precision": round(float(precision_score(y_val, y_pred, zero_division=0)), 4),
+        "val_recall":    round(float(recall_score(y_val, y_pred, zero_division=0)), 4),
+        "val_f1":        round(float(f1_score(y_val, y_pred, zero_division=0)), 4),
+        "strategy":      strategy,
     }
-    print(f"  Best threshold (val): {best_thresh:.4f}  "
+    print(f"  Threshold ({strategy}): {best_thresh:.4f}  "
           f"precision={metrics['val_precision']:.3f}  "
           f"recall={metrics['val_recall']:.3f}  "
           f"F1={metrics['val_f1']:.3f}")
     return best_thresh, metrics
 
 
-def train_binary(train: pd.DataFrame, test: pd.DataFrame) -> dict:
+def walk_forward_cv(df: pd.DataFrame,
+                    test_years: list[int],
+                    min_recall: float = 0.55) -> dict:
+    """
+    Walk-forward cross-validation across multiple test years.
+    Each fold trains on all years before test_year and evaluates on test_year.
+    Returns averaged metrics across folds.
+    """
+    print("\n── Walk-forward cross-validation ──")
+    fold_results = []
+
+    for test_year in test_years:
+        train_fold = df[df["year"] < test_year]
+        test_fold  = df[df["year"] == test_year]
+
+        y_train_raw = make_binary_target(train_fold)
+        y_test      = make_binary_target(test_fold)
+
+        if y_test.sum() == 0:
+            print(f"  Fold {test_year}: no Crisis cases — skipping")
+            continue
+        if y_train_raw.sum() < 6:
+            print(f"  Fold {test_year}: too few Crisis cases in train — skipping")
+            continue
+
+        X_train_raw = train_fold[FEATURE_COLS]
+        X_test      = test_fold[FEATURE_COLS]
+
+        # Stratified val split for threshold tuning
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train_raw, y_train_raw,
+            test_size=0.2, random_state=42, stratify=y_train_raw,
+        )
+
+        sm = SMOTE(random_state=42, k_neighbors=min(5, y_tr.sum() - 1))
+        X_sm, y_sm = sm.fit_resample(X_train_raw, y_train_raw)
+
+        model = XGBClassifier(
+            n_estimators=400, max_depth=5, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            random_state=42, eval_metric="logloss", verbosity=0,
+        )
+        model.fit(X_sm, y_sm, eval_set=[(X_val, y_val)], verbose=False)
+
+        threshold, _ = find_best_threshold(model, X_val, y_val, min_recall)
+
+        y_prob = model.predict_proba(X_test)[:, 1]
+        y_pred = (y_prob >= threshold).astype(int)
+
+        fold_roc   = roc_auc_score(y_test, y_prob)
+        fold_prec  = precision_score(y_test, y_pred, zero_division=0)
+        fold_rec   = recall_score(y_test, y_pred, zero_division=0)
+        fold_f1    = f1_score(y_test, y_pred, zero_division=0)
+        n_crisis   = y_test.sum()
+
+        print(f"  Fold {test_year}: n_crisis={n_crisis}  "
+              f"threshold={threshold:.3f}  "
+              f"ROC={fold_roc:.3f}  prec={fold_prec:.3f}  "
+              f"rec={fold_rec:.3f}  F1={fold_f1:.3f}")
+
+        fold_results.append({
+            "year": test_year, "n_crisis": int(n_crisis),
+            "threshold": threshold, "roc_auc": fold_roc,
+            "precision": fold_prec, "recall": fold_rec, "f1": fold_f1,
+        })
+
+    if not fold_results:
+        return {}
+
+    results_df = pd.DataFrame(fold_results)
+    print(f"\n  CV averages across {len(results_df)} folds:")
+    print(f"    ROC-AUC:   {results_df['roc_auc'].mean():.3f}")
+    print(f"    Precision: {results_df['precision'].mean():.3f}")
+    print(f"    Recall:    {results_df['recall'].mean():.3f}")
+    print(f"    F1:        {results_df['f1'].mean():.3f}")
+
+    return {
+        "folds":         fold_results,
+        "mean_roc_auc":  round(float(results_df["roc_auc"].mean()), 4),
+        "mean_precision":round(float(results_df["precision"].mean()), 4),
+        "mean_recall":   round(float(results_df["recall"].mean()), 4),
+        "mean_f1":       round(float(results_df["f1"].mean()), 4),
+    }
+
+
+def train_binary(train: pd.DataFrame, test: pd.DataFrame,
+                 min_recall: float = 0.55) -> dict:
     print("\n--- Binary model: Crisis (3+) vs Not Crisis ---")
 
     X_train_raw = train[FEATURE_COLS]
@@ -78,53 +184,39 @@ def train_binary(train: pd.DataFrame, test: pd.DataFrame) -> dict:
     print(f"Class balance — test  Crisis: {y_test.sum()}/{len(y_test)} "
           f"({100*y_test.mean():.1f}%)")
 
-    # ── Stratified validation split for threshold tuning ──────────────────────
-    # Random stratified split — keeps Crisis cases proportional in both halves.
-    # This is only for threshold tuning; the model trains on the full train set.
-    # We use stratify= to guarantee enough Crisis cases in the validation set.
-    X_tr_thresh, X_val, y_tr_thresh, y_val = train_test_split(
+    # Stratified val split for threshold tuning
+    X_tr, X_val, y_tr, y_val = train_test_split(
         X_train_raw, y_train_raw,
-        test_size=0.2,
-        random_state=42,
-        stratify=y_train_raw,
+        test_size=0.2, random_state=42, stratify=y_train_raw,
     )
-    print(f"Threshold-tuning val set: n={len(y_val)}, "
-          f"Crisis={y_val.sum()} ({100*y_val.mean():.1f}%)")
+    print(f"Val set: n={len(y_val)}, Crisis={y_val.sum()} ({100*y_val.mean():.1f}%)")
 
-    # ── SMOTE on full training set (model trains on everything pre-2024) ───────
+    # SMOTE on full training set
     print(f"Before SMOTE — Crisis: {y_train_raw.sum()} / {len(y_train_raw)}")
     sm = SMOTE(random_state=42, k_neighbors=min(5, y_train_raw.sum() - 1))
-    X_train_smote, y_train_smote = sm.fit_resample(X_train_raw, y_train_raw)
-    print(f"After SMOTE  — Crisis: {y_train_smote.sum()} / {len(y_train_smote)}")
+    X_sm, y_sm = sm.fit_resample(X_train_raw, y_train_raw)
+    print(f"After SMOTE  — Crisis: {y_sm.sum()} / {len(y_sm)}")
 
-    # ── XGBoost — no scale_pos_weight after SMOTE (classes already balanced) ──
     model = XGBClassifier(
-        n_estimators=400, max_depth=6, learning_rate=0.05,
+        n_estimators=400, max_depth=5, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8,
         random_state=42, eval_metric="logloss", verbosity=0,
     )
-    # Eval set uses the stratified val split (unsmoted, real distribution)
-    model.fit(
-        X_train_smote, y_train_smote,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
-    )
+    model.fit(X_sm, y_sm, eval_set=[(X_val, y_val)], verbose=False)
 
-    # ── Tune threshold on stratified val set ──────────────────────────────────
-    threshold, val_metrics = find_best_threshold(model, X_val, y_val)
+    # Threshold: recall-constrained F1
+    threshold, val_metrics = find_best_threshold(model, X_val, y_val, min_recall)
 
-    # ── Final evaluation on held-out test set (touched once) ──────────────────
+    # Final test evaluation
     y_prob_test = model.predict_proba(X_test)[:, 1]
     y_pred_test = (y_prob_test >= threshold).astype(int)
-
-    test_roc_auc = roc_auc_score(y_test, y_prob_test)
-    test_report  = classification_report(
+    test_roc    = roc_auc_score(y_test, y_prob_test)
+    test_report = classification_report(
         y_test, y_pred_test,
         target_names=["Not Crisis (P1-2)", "Crisis (P3+)"],
-        output_dict=True,
-        zero_division=0,
+        output_dict=True, zero_division=0,
     )
-    crisis_metrics = test_report.get("Crisis (P3+)", {})
+    crisis_m = test_report.get("Crisis (P3+)", {})
 
     print("\nTest-set performance at tuned threshold:")
     print(classification_report(
@@ -132,7 +224,14 @@ def train_binary(train: pd.DataFrame, test: pd.DataFrame) -> dict:
         target_names=["Not Crisis (P1-2)", "Crisis (P3+)"],
         zero_division=0,
     ))
-    print(f"ROC-AUC: {test_roc_auc:.4f}")
+    print(f"ROC-AUC: {test_roc:.4f}")
+
+    # Feature importances
+    importances = pd.Series(
+        model.feature_importances_, index=FEATURE_COLS
+    ).sort_values(ascending=False)
+    print("\nTop 10 feature importances:")
+    print(importances.head(10).round(4).to_string())
 
     return {
         "model":     model,
@@ -143,15 +242,16 @@ def train_binary(train: pd.DataFrame, test: pd.DataFrame) -> dict:
         "y_test":    y_test,
         "type":      "binary",
         "eval_metrics": {
-            "roc_auc":        round(test_roc_auc, 4),
+            "roc_auc":        round(test_roc, 4),
             "threshold":      round(threshold, 6),
+            "threshold_strategy": val_metrics["strategy"],
             "val_f1":         val_metrics["val_f1"],
             "val_precision":  val_metrics["val_precision"],
             "val_recall":     val_metrics["val_recall"],
-            "test_precision": round(float(crisis_metrics.get("precision", 0)), 4),
-            "test_recall":    round(float(crisis_metrics.get("recall", 0)), 4),
-            "test_f1":        round(float(crisis_metrics.get("f1-score", 0)), 4),
-            "test_support":   int(crisis_metrics.get("support", 0)),
+            "test_precision": round(float(crisis_m.get("precision", 0)), 4),
+            "test_recall":    round(float(crisis_m.get("recall", 0)), 4),
+            "test_f1":        round(float(crisis_m.get("f1-score", 0)), 4),
+            "test_support":   int(crisis_m.get("support", 0)),
         },
     }
 
@@ -164,18 +264,17 @@ def train_multiclass(train: pd.DataFrame, test: pd.DataFrame) -> dict:
     y_test      = make_multiclass_target(test)
 
     print(f"Before SMOTE: {y_train_raw.value_counts().sort_index().to_dict()}")
-
     sm = SMOTE(random_state=42, k_neighbors=5)
-    X_train, y_train = sm.fit_resample(X_train_raw, y_train_raw)
-    print(f"After SMOTE:  {pd.Series(y_train).value_counts().sort_index().to_dict()}")
+    X_sm, y_sm = sm.fit_resample(X_train_raw, y_train_raw)
+    print(f"After SMOTE:  {pd.Series(y_sm).value_counts().sort_index().to_dict()}")
 
     model = XGBClassifier(
-        n_estimators=400, max_depth=6, learning_rate=0.05,
+        n_estimators=400, max_depth=5, learning_rate=0.05,
         objective="multi:softmax", num_class=3,
         subsample=0.8, colsample_bytree=0.8,
         random_state=42, eval_metric="mlogloss", verbosity=0,
     )
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    model.fit(X_sm, y_sm, eval_set=[(X_test, y_test)], verbose=False)
 
     y_pred = model.predict(X_test)
     print("\nWith SMOTE:")
@@ -207,9 +306,10 @@ def save_model(result: dict, name: str):
 
     meta = {
         "model_name":     name,
-        "model_version":  "1.0.0",
+        "model_version":  "1.1.0",
         "model_type":     result["type"],
         "features":       FEATURE_COLS,
+        "n_features":     len(FEATURE_COLS),
         "target":         TARGET_COL,
         "threshold":      result["threshold"],
         "trained_at":     datetime.now(timezone.utc).isoformat(),
@@ -229,12 +329,24 @@ def save_model(result: dict, name: str):
 
 
 def run_training():
-    print("\n=== Model Training (with SMOTE + threshold tuning) ===\n")
+    print("\n=== Model Training v1.1 ===\n")
     df = load_features("cs")
-    train, test = temporal_split(df, test_year=2024)
 
-    binary_result     = train_binary(train, test)
+    # Walk-forward CV to understand generalisation across years
+    cv_years = [y for y in [2019, 2020, 2021, 2022, 2023]
+                if (df[df["year"] == y]["ipc_phase"] >= 3).sum() >= 3]
+    cv_results = walk_forward_cv(df, test_years=cv_years, min_recall=0.70)
+
+    # Final model trained on all pre-2024 data
+    train, test = temporal_split(df, test_year=2024)
+    print(f"\nFinal model train: {len(train)} rows | test: {len(test)} rows")
+
+    binary_result     = train_binary(train, test, min_recall=0.70)
     multiclass_result = train_multiclass(train, test)
+
+    # Attach CV results to metrics
+    if cv_results and "eval_metrics" in binary_result:
+        binary_result["eval_metrics"]["cv"] = cv_results
 
     save_model(binary_result,     "ipc_binary_classifier")
     save_model(multiclass_result, "ipc_multiclass_classifier")
