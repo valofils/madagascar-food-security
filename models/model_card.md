@@ -272,3 +272,38 @@ See `serverless/DEPLOY.md` for the full deployment runbook.
 |---------|------|---------|
 | v1.0.0 | April 2025 | Initial release — 16 features including leaky unit aggregates |
 | v1.1.0 | April 2026 | Removed leaky features; added cold-start interactions; walk-forward CV; recall-constrained threshold; full failure analysis |
+---
+
+## 11. Experiment Log
+
+### Regional spatial covariates (attempted, reverted — April 2026)
+
+**Hypothesis**: Regional crisis rate from the previous period is a proxy for
+rainfall deficit. When neighboring units are in Crisis, drought is likely
+affecting the whole region, which should predict escalation in the focal unit.
+
+**Features added**:
+- `region_mean_phase_lag1` — mean IPC phase of other units in same region, lagged
+- `region_pct_crisis_lag1` — fraction of regional units in Crisis, lagged
+- `region_crisis_count_lag1` — count of Crisis units in region, lagged
+- `region_crisis_trend` — change in regional crisis rate over two periods
+- `cold_start_regional` — interaction: unit below Crisis × regional crisis rate
+
+All features computed leave-one-out (excluding focal unit) and lagged by one
+period to prevent leakage.
+
+**Result**: ROC-AUC dropped from 0.801 to 0.665. Crisis recall unchanged at 0%.
+Regional features had zero importance in the final model.
+
+**Root cause**: The 2024/2026 Crisis events are spatially isolated.
+`cold_start_regional` was exactly 0.0 for all 37 test Crisis cases —
+neighboring units were NOT in crisis. The regional spillover signal that
+characterised 2021/2022 (a regional drought) does not exist in 2024/2026,
+where individual units escalated independently.
+
+**Conclusion**: The 2021/2022 vs 2024/2026 distributional shift operates at
+both the unit level (lower lag values) and the regional level (isolated vs
+clustered Crisis). No feature constructed from phase history alone can bridge
+this gap. True external covariates (CHIRPS rainfall, NDVI anomaly, market
+price indices) are required to capture the drivers of isolated cold-start
+escalation.
