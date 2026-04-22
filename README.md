@@ -1,7 +1,8 @@
 # Madagascar Food Security Early Warning System
 
 > Predicting acute food insecurity phases for Madagascar livelihood zones using
-> FEWS NET IPC data and XGBoost — deployed as a FastAPI service with Docker.
+> FEWS NET IPC data and XGBoost — deployed as a serverless AWS Lambda function
+> behind API Gateway, with a FastAPI local service and Docker support.
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.136-green.svg)](https://fastapi.tiangolo.com/)
@@ -15,11 +16,12 @@
 
 This project builds an end-to-end machine learning pipeline that ingests IPC
 (Integrated Food Security Phase Classification) data from the FEWS NET API,
-engineers temporal and geographic features, trains binary and multiclass XGBoost
-classifiers, and serves predictions via a REST API.
+engineers temporal lag and cold-start interaction features, trains binary and
+multiclass XGBoost classifiers with walk-forward cross-validation, and serves
+predictions via both a local FastAPI service and a serverless AWS Lambda function.
 
-The system outputs an `alert_level` — **HIGH**, **MODERATE**, or **LOW** — for
-any Madagascar livelihood zone based on its historical food security trajectory.
+The system outputs a crisis probability and binary label for any Madagascar
+livelihood zone based on its historical food security trajectory.
 
 **Domain context**: Madagascar experiences chronic food insecurity, particularly
 in the Grand Sud (Androy, Atsimo Andrefana) and Grand Sud-Est (Befotaka,
@@ -31,18 +33,34 @@ working group processes.
 
 ## Results
 
-| Model | Accuracy | ROC-AUC | Crisis F1 |
-|-------|----------|---------|-----------|
-| Binary (Crisis vs Not) | 0.95 | **0.916** | 0.10 |
-| Multiclass (P1 / P2 / P3+) | 0.93 | — | 0.10 |
+### Walk-forward cross-validation (2019–2023)
 
-- **Train**: 3,211 rows, 2016–2023
-- **Test**: 759 rows, 2024–2026 (temporal split, no leakage)
-- Top features: `unit_mean_phase`, `unit_max_phase`, `unit_pct_crisis`, `lag_1`
-- Crisis recall is low due to sparse test cases (37/759); ROC-AUC of 0.916
-  confirms strong discriminative ability
+| Fold | n Crisis | ROC-AUC | Precision | Recall | F1 |
+|------|----------|---------|-----------|--------|----|
+| 2019 | 11 | 0.990 | 0.556 | 0.909 | 0.690 |
+| 2020 | 23 | 0.975 | 0.759 | 0.957 | 0.846 |
+| 2021 | 63 | 0.977 | 0.920 | 0.730 | 0.814 |
+| 2022 | 79 | 0.987 | 0.716 | 0.987 | 0.830 |
+| 2023 | 4  | 0.978 | 0.125 | 1.000 | 0.222 |
+| **Mean** | — | **0.981** | **0.615** | **0.917** | **0.680** |
 
-See [`models/model_card.md`](models/model_card.md) for full evaluation details.
+### Held-out test set (2024–2026)
+
+| Model | ROC-AUC | Crisis Recall | Crisis F1 |
+|-------|---------|---------------|-----------|
+| Binary (Crisis vs Not) | 0.801 | 0.00 | 0.00 |
+| Multiclass (P1 / P2 / P3+) | — | 0.00 | 0.00 |
+
+**The model fails on the 2024–2026 test period due to distributional shift** —
+Crisis events in 2024/2026 arrive from lower baseline phases (cold-start pattern)
+in geographic units not previously seen in Crisis. Walk-forward CV confirms the
+model generalises well within its training distribution (recall 0.917). Full
+failure analysis with quantified root causes and recommended mitigations is in
+[`models/model_card.md`](models/model_card.md).
+
+- **Train**: 2,948 rows, 2016–2023 | **Test**: 759 rows, 2024–2026
+- **Features**: 20 (temporal, lag/rolling, cold-start interactions)
+- **Threshold**: recall-constrained (≥70%) — missing Crisis is worse than false alarm
 
 ---
 
@@ -53,24 +71,30 @@ madagascar-food-security/
 ├── src/
 │   ├── data_ingestion.py   # FEWS NET API fetcher with pagination + retry
 │   ├── preprocessing.py    # clean, harmonise IPC scales, scenario split
-│   ├── features.py         # lag/rolling/unit features + categorical encoding
-│   ├── train.py            # XGBoost + SMOTE + threshold tuning
+│   ├── features.py         # lag/rolling/cold-start features (20 total, leak-free)
+│   ├── train.py            # XGBoost + SMOTE + walk-forward CV + threshold tuning
 │   ├── evaluate.py         # classification report, ROC-AUC, confusion matrix
 │   └── predict.py          # predict_combined() → alert_level
 ├── api/
 │   └── main.py             # FastAPI: /health /features /example /predict
+├── serverless/
+│   ├── lambda_function.py  # AWS Lambda handler (cold-start caching, threshold)
+│   ├── Dockerfile          # Lambda container image (python:3.11)
+│   ├── requirements.txt    # pinned deps for Lambda layer
+│   ├── test_lambda_local.py# 5-case local test suite (no AWS needed)
+│   └── DEPLOY.md           # 8-step AWS deployment runbook
 ├── models/
-│   ├── ipc_binary_classifier.pkl
-│   ├── ipc_multiclass_classifier.pkl
-│   ├── model_card.md
+│   ├── ipc_binary_classifier.pkl       # gitignored
+│   ├── ipc_multiclass_classifier.pkl   # gitignored
+│   ├── model_card.md                   # full eval + failure analysis
 │   └── evaluation_metrics.json
 ├── tests/
 │   ├── test_ingestion.py   # 13 tests — mocked API, pagination, file saving
-│   └── test_features.py    # 26 tests — lag, rolling, unit stats, encoding
+│   └── test_features.py    # 26 tests — lag, rolling, encoding
 ├── data/
 │   ├── raw/                # FEWS NET API responses (gitignored)
 │   └── processed/          # cleaned CSVs + evaluation plots
-├── Dockerfile
+├── Dockerfile              # FastAPI container
 ├── run_pipeline.py         # pipeline orchestrator (CLI)
 ├── config.py               # paths, API URLs, constants
 └── requirements.txt
@@ -102,12 +126,9 @@ python run_pipeline.py --steps train evaluate
 
 # Skip ingestion if data is already fresh
 python run_pipeline.py --skip ingest
-
-# List all available stages
-python run_pipeline.py --list
 ```
 
-### 3. Serve the API
+### 3. Serve the API locally
 
 ```bash
 PYTHONPATH=$(pwd) uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -129,45 +150,34 @@ pytest tests/ -v
 # 39 passed in ~0.8s
 ```
 
+### 6. Test the Lambda handler locally
+
+```bash
+python serverless/test_lambda_local.py
+# 5 passed — no AWS account needed
+```
+
 ---
 
 ## API Reference
 
-Base URL: `http://localhost:8000`
+### Local FastAPI (`http://localhost:8000`)
 
-### `GET /health`
-```json
-{"status": "ok"}
-```
+#### `POST /predict`
 
-### `GET /features`
-Returns the list of 16 required input features.
-
-### `GET /example`
-Returns an example request body for a high-risk Grand Sud profile.
-
-### `POST /predict`
-
-**Request body** (all fields required):
+**Request body** (20 features required):
 
 ```json
 {
-  "year": 2024,
-  "month": 2,
-  "quarter": 1,
-  "is_lean_season": 1,
-  "period_days": 29,
-  "lag_1": 3.0,
-  "lag_2": 3.0,
-  "rolling_mean_3": 3.0,
-  "rolling_max_3": 3.0,
-  "phase_trend": 0.0,
-  "unit_mean_phase": 2.8,
-  "unit_max_phase": 4.0,
-  "unit_pct_crisis": 0.65,
-  "unit_code": 42,
-  "is_ipc2": 0,
-  "preference_rating": 90.0
+  "year": 2024, "month": 1, "quarter": 1,
+  "is_lean_season": 1, "period_days": 90,
+  "lag_1": 2.5, "lag_2": 2.2, "lag_3": 2.0,
+  "rolling_mean_3": 2.3, "rolling_max_3": 2.5,
+  "phase_trend": 0.3,
+  "unit_hist_max": 3.0, "crisis_momentum": 1.0,
+  "is_cold_start": 1, "lean_x_lag1": 2.5, "lean_x_trend": 0.3,
+  "gap_to_crisis": 0.5, "escalation_risk": 3.45,
+  "is_ipc2": 0, "preference_rating": 1.0
 }
 ```
 
@@ -179,27 +189,42 @@ Returns an example request body for a high-risk Grand Sud profile.
   "binary": {
     "prediction": 1,
     "label": "Crisis or worse (Phase 3+)",
-    "probability": 0.1274,
-    "threshold": 0.0016,
+    "probability": 0.82,
+    "threshold": 0.45,
     "is_crisis": true
   },
   "multiclass": {
     "prediction": 2,
     "label": "Crisis+ (P3+)",
     "probabilities": {
-      "Minimal (P1)": 0.0006,
-      "Stressed (P2)": 0.3919,
-      "Crisis+ (P3+)": 0.6075
+      "Minimal (P1)": 0.06,
+      "Stressed (P2)": 0.12,
+      "Crisis+ (P3+)": 0.82
     }
-  },
-  "features_used": { "...": "..." }
+  }
 }
 ```
 
-**Alert level logic**:
-- `HIGH` — both models agree on crisis
-- `MODERATE` — binary model flags crisis, multiclass disagrees
-- `LOW` — neither model flags crisis
+### Serverless Lambda (`POST /predict` via API Gateway)
+
+Same request body and response schema as above, minus `alert_level`.
+See [`serverless/DEPLOY.md`](serverless/DEPLOY.md) for deployment instructions.
+
+---
+
+## Feature Engineering
+
+20 leak-free features in four groups:
+
+| Group | Features |
+|-------|---------|
+| Temporal | `year`, `month`, `quarter`, `is_lean_season`, `period_days` |
+| Lag / rolling | `lag_1`, `lag_2`, `lag_3`, `rolling_mean_3`, `rolling_max_3`, `phase_trend`, `unit_hist_max`, `crisis_momentum` |
+| Cold-start interactions | `is_cold_start`, `lean_x_lag1`, `lean_x_trend`, `gap_to_crisis`, `escalation_risk` |
+| Categorical | `is_ipc2`, `preference_rating` |
+
+Features removed in v1.1: `unit_mean_phase`, `unit_pct_crisis`, `unit_max_phase`,
+`unit_code` — all computed on the full dataset, causing target leakage into training rows.
 
 ---
 
@@ -222,22 +247,9 @@ fetch fresh data from the API.
 
 ---
 
-## Pipeline Stages
-
-| Stage | Script | Description |
-|-------|--------|-------------|
-| `ingest` | `src/data_ingestion.py` | Fetch raw data from FEWS NET API |
-| `preprocess` | `src/preprocessing.py` | Clean, harmonise, split by scenario |
-| `features` | `src/features.py` | Lag, rolling, unit features + encoding |
-| `train` | `src/train.py` | XGBoost + SMOTE + threshold tuning |
-| `evaluate` | `src/evaluate.py` | Metrics, plots, feature importance |
-
----
-
 ## Zoomcamp Module Mapping
 
-This project was built following the
-[ML Zoomcamp](https://github.com/DataTalksClub/machine-learning-zoomcamp) curriculum:
+Built following the [ML Zoomcamp](https://github.com/DataTalksClub/machine-learning-zoomcamp) curriculum:
 
 | Module | Topic | Status |
 |--------|-------|--------|
@@ -247,15 +259,15 @@ This project was built following the
 | 4 | Evaluation metrics | ✅ |
 | 5 | Deployment (FastAPI + Docker) | ✅ |
 | 6 | Decision trees & XGBoost | ✅ |
-| 8 | Deep learning | ⏳ future |
-| 9 | Serverless (AWS Lambda) | ⏳ future |
+| 8 | Deep learning (LSTM) | ✅ |
+| 9 | Serverless (AWS Lambda + API Gateway) | ✅ |
 | 10 | Kubernetes | ⏳ future |
 
 ---
 
 ## Author
 
-**Mariel Valosimbazafy**  
+**Mariel**  
 MSc Mathematics, AIMS Ghana (2026)  
 IPC Level I Analyst | M&E Specialist | Data Scientist  
 GitHub: [@valofils](https://github.com/valofils)
