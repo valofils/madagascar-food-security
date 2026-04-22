@@ -1,5 +1,6 @@
 {
   "model_name": "ipc_multiclass_classifier",
+  "model_version": "1.0.0",
   "model_type": "multiclass",
   "features": [
     "year",
@@ -12,16 +13,13 @@
     "rolling_mean_3",
     "rolling_max_3",
     "phase_trend",
-    "unit_mean_phase",
-    "unit_max_phase",
-    "unit_pct_crisis",
-    "unit_code",
+    "unit_hist_max",
     "is_ipc2",
     "preference_rating"
   ],
   "target": "ipc_phase",
   "threshold": 0.5,
-  "trained_at": "2026-04-21T16:26:32.992181+00:00",
-  "train_accuracy": 0.9975085643101838,
-  "test_accuracy": 0.9314888010540184
+  "trained_at": "2026-04-22T10:00:24.577970+00:00",
+  "train_accuracy": 0.9461227032077234,
+  "test_accuracy": 0.924901185770751
 }

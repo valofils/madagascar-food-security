@@ -1,3 +1,11 @@
 {
-  "roc_auc": 0.9159991015946695
+  "roc_auc": 0.899,
+  "threshold": 0.790582,
+  "val_f1": 0.9318,
+  "val_precision": 0.9318,
+  "val_recall": 0.9318,
+  "test_precision": 0.0,
+  "test_recall": 0.0,
+  "test_f1": 0.0,
+  "test_support": 37
 }
