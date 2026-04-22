@@ -3,19 +3,10 @@ import sys
 import pickle
 import pandas as pd
 import numpy as np
-from typing import Union
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import MODELS_DIR
 from src.features import FEATURE_COLS
-
-IPC_PHASE_LABELS = {
-    0: "Minimal",
-    1: "Stressed",
-    2: "Crisis",
-    3: "Emergency",
-    4: "Catastrophe",
-}
 
 CRISIS_LABEL = {
     0: "Not Crisis (Phase 1-2)",
@@ -36,38 +27,30 @@ def _to_df(features: dict) -> pd.DataFrame:
 
 
 def predict_binary(features: dict) -> dict:
-    """
-    Predict whether a geographic unit × period is Crisis (Phase 3+) or not.
-    Returns label, probability, and threshold used.
-    """
     artifact  = load_artifact("ipc_binary_classifier")
     model     = artifact["model"]
     threshold = artifact["threshold"]
 
-    X        = _to_df(features)
-    prob     = float(model.predict_proba(X)[0, 1])
-    label    = int(prob >= threshold)
+    X    = _to_df(features)
+    prob = float(model.predict_proba(X)[0, 1])
+    pred = int(prob >= threshold)
 
     return {
-        "prediction":  label,
-        "label":       CRISIS_LABEL[label],
+        "prediction":  pred,
+        "label":       CRISIS_LABEL[pred],
         "probability": round(prob, 4),
         "threshold":   round(threshold, 4),
-        "is_crisis":   bool(label == 1),
+        "is_crisis":   bool(pred == 1),
     }
 
 
 def predict_multiclass(features: dict) -> dict:
-    """
-    Predict IPC phase class (0=P1, 1=P2, 2=P3+).
-    Returns predicted class, label, and per-class probabilities.
-    """
     artifact = load_artifact("ipc_multiclass_classifier")
     model    = artifact["model"]
 
-    X        = _to_df(features)
-    pred     = int(model.predict(X)[0])
-    probs    = model.predict_proba(X)[0]
+    X     = _to_df(features)
+    pred  = int(model.predict(X)[0])
+    probs = model.predict_proba(X)[0]
 
     return {
         "prediction": pred,
@@ -81,49 +64,53 @@ def predict_multiclass(features: dict) -> dict:
 
 
 def predict_combined(features: dict) -> dict:
-    """
-    Run both models and return a combined prediction with confidence signal.
-    This is the main entry point for the API.
-    """
+    """Run both models and return a combined prediction. Main API entry point."""
     binary     = predict_binary(features)
     multiclass = predict_multiclass(features)
 
-    # agreement signal: both models agree on crisis
     both_crisis = binary["is_crisis"] and multiclass["prediction"] == 2
     alert_level = "HIGH" if both_crisis else ("MODERATE" if binary["is_crisis"] else "LOW")
 
     return {
-        "alert_level":  alert_level,
-        "binary":       binary,
-        "multiclass":   multiclass,
+        "alert_level": alert_level,
+        "binary":      binary,
+        "multiclass":  multiclass,
         "features_used": {k: features.get(k) for k in FEATURE_COLS},
     }
 
 
 if __name__ == "__main__":
-    # smoke test with a sample Grand Sud feature vector
-    sample = {
-        "year": 2024, "month": 2, "quarter": 1,
-        "is_lean_season": 1, "period_days": 29,
-        "lag_1": 3.0, "lag_2": 3.0,
-        "rolling_mean_3": 3.0, "rolling_max_3": 3.0,
-        "phase_trend": 0.0,
-        "unit_mean_phase": 2.8, "unit_max_phase": 4.0, "unit_pct_crisis": 0.65,
-        "unit_code": 42, "is_ipc2": 0, "preference_rating": 90,
+    # Smoke test — v1.1 feature schema
+    HIGH_RISK = {
+        "year": 2024, "month": 1, "quarter": 1,
+        "is_lean_season": 1, "period_days": 90,
+        "lag_1": 2.5, "lag_2": 2.2, "lag_3": 2.0,
+        "rolling_mean_3": 2.3, "rolling_max_3": 2.5,
+        "phase_trend": 0.3,
+        "unit_hist_max": 3.0, "crisis_momentum": 1.0,
+        "is_cold_start": 1, "lean_x_lag1": 2.5, "lean_x_trend": 0.3,
+        "gap_to_crisis": 0.5, "escalation_risk": 3.45,
+        "is_ipc2": 0, "preference_rating": 1.0,
     }
 
-    print("\n=== Predict: Grand Sud (high-risk profile) ===")
-    result = predict_combined(sample)
-    print(f"Alert level : {result['alert_level']}")
-    print(f"Binary      : {result['binary']['label']} (prob={result['binary']['probability']})")
-    print(f"Multiclass  : {result['multiclass']['label']}")
-    print(f"Probabilities: {result['multiclass']['probabilities']}")
+    LOW_RISK = {
+        "year": 2024, "month": 6, "quarter": 2,
+        "is_lean_season": 0, "period_days": 91,
+        "lag_1": 1.5, "lag_2": 1.6, "lag_3": 1.7,
+        "rolling_mean_3": 1.6, "rolling_max_3": 1.8,
+        "phase_trend": -0.1,
+        "unit_hist_max": 2.0, "crisis_momentum": 0.0,
+        "is_cold_start": 0, "lean_x_lag1": 0.0, "lean_x_trend": 0.0,
+        "gap_to_crisis": 1.5, "escalation_risk": 0.0,
+        "is_ipc2": 1, "preference_rating": 0.8,
+    }
 
-    print("\n=== Predict: low-risk profile ===")
-    low_risk = {**sample, "lag_1": 1.0, "lag_2": 1.0, "rolling_mean_3": 1.0,
-                "rolling_max_3": 1.0, "unit_mean_phase": 1.1,
-                "unit_max_phase": 2.0, "unit_pct_crisis": 0.02}
-    result2 = predict_combined(low_risk)
-    print(f"Alert level : {result2['alert_level']}")
-    print(f"Binary      : {result2['binary']['label']} (prob={result2['binary']['probability']})")
-    print(f"Multiclass  : {result2['multiclass']['label']}")
+    for label, sample in [("High-risk (lean season, cold-start)", HIGH_RISK),
+                           ("Low-risk  (harvest season, stable)",  LOW_RISK)]:
+        print(f"\n=== {label} ===")
+        result = predict_combined(sample)
+        print(f"Alert level  : {result['alert_level']}")
+        print(f"Binary       : {result['binary']['label']} "
+              f"(p={result['binary']['probability']}, thr={result['binary']['threshold']})")
+        print(f"Multiclass   : {result['multiclass']['label']}")
+        print(f"Probabilities: {result['multiclass']['probabilities']}")
