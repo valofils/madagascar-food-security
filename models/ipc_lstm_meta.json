@@ -1,0 +1,19 @@
+{
+  "model_name": "ipc_lstm",
+  "model_type": "LSTM binary classifier (Crisis Phase 3+)",
+  "framework": "TensorFlow 2.21.0 / Keras 3.14.0",
+  "seq_len": 4,
+  "n_features": 6,
+  "features": [
+    "ipc_phase",
+    "is_lean_season",
+    "period_days",
+    "preference_rating",
+    "unit_pct_crisis",
+    "unit_mean_phase"
+  ],
+  "threshold": 0.9076,
+  "val_auc": 0.9024,
+  "epochs_run": 13,
+  "trained_at": "2026-04-22T09:18:20.002195+00:00"
+}
